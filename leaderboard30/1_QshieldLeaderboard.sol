@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 contract QshieldLeaderboard {
+    using ECDSA for bytes32;
     // ==================== CONFIG ====================
     address public immutable ADMIN;
     address public immutable GAME_SIGNER; // your backend signing key
@@ -58,14 +60,15 @@ contract QshieldLeaderboard {
         require(score > 0, "Score > 0");
 
         // === Signature verification (the real security) ===
-        bytes32 message = keccak256(abi.encodePacked(
+        bytes32 messageHash = keccak256(abi.encodePacked(
             msg.sender,
             identifier,
             score,
             nonce,
             block.chainid
-        ));
-        address recovered = ecrecover(message, v, r, s);
+        )); 
+        bytes32 prefixedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
+        address recovered = ECDSA.recover(prefixedHash, v, r, s);
         require(recovered == GAME_SIGNER, "Invalid signature");
 
         bytes32 idHash = keccak256(abi.encodePacked(identifier));
