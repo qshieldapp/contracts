@@ -1,54 +1,46 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
+
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 contract QshieldLeaderboard2 {
     using ECDSA for bytes32;
+
     // ==================== CONFIG ====================
     address public immutable ADMIN;
-    address public immutable GAME_SIGNER; // the backend signing key
-
+    address public immutable GAME_SIGNER;
+    uint256 public immutable MAX_ENTRIES = 50;
     mapping(address => bool) public isModerator;
 
-    uint256 public constant MAX_ENTRIES = 50;
-
-    // ==================== DATA ====================
-    mapping(bytes32 => uint256) public scores;           // idHash => score
-    mapping(address => uint256) public scores2;          // wallet => score
-    mapping(bytes32 => string) public identifierOf;      // only stored for top players
+    // ==================== DATA  ====================
+    mapping(bytes32 => uint256) public scores;           // idHash => best score
+    mapping(address => uint256) public scores2;          // player address => score (kept for backward compat)
+    mapping(bytes32 => string) public identifierOf;
     mapping(bytes32 => bool) public disqualified;
+    mapping(bytes32 => uint256) private heapIndex;       // idHash => position in leaderboard (0 = not present)
 
     struct Entry {
         bytes32 idHash;
         uint256 score;
     }
-    Entry[] private leaderboard; // max-heap (index 0 is unused)
+    Entry[] private leaderboard; // index 0 unused → min-heap of the top MAX_ENTRIES
 
-    // ==================== EVENTS ====================
+    // ==================== EVENTS & MODIFIERS ====================
     event ScoreSubmitted(bytes32 indexed idHash, string identifier, uint256 score, address player);
     event ScoreDisqualified(bytes32 indexed idHash, string identifier);
     event ModeratorAdded(address moderator);
     event ModeratorRemoved(address moderator);
 
-    // ==================== MODIFIERS ====================
-    modifier onlyAdmin() {
-        require(msg.sender == ADMIN, "Not admin");
-        _;
-    }
-    modifier onlyModerator() {
-        require(msg.sender == ADMIN || isModerator[msg.sender], "Not moderator");
-        _;
-    }
+    modifier onlyAdmin() { require(msg.sender == ADMIN, "Not admin"); _; }
+    modifier onlyModerator() { require(msg.sender == ADMIN || isModerator[msg.sender], "Not moderator"); _; }
 
-    // ==================== CONSTRUCTOR ====================
     constructor(address gameSigner) {
         require(gameSigner != address(0), "Signer zero");
         ADMIN = msg.sender;
         GAME_SIGNER = gameSigner;
-        leaderboard.push(Entry(bytes32(0), 0)); // dummy at index 0
+        leaderboard.push(Entry(bytes32(0), 0)); // dummy index 0
     }
 
-    // ==================== USER: SIGNED SUBMISSION ====================
     function submitScore(
         string calldata identifier,
         uint256 score,
@@ -59,59 +51,127 @@ contract QshieldLeaderboard2 {
     ) external {
         require(score > 0, "Score > 0");
 
-        // === Signature verification (the real security) ===
-        bytes32 messageHash = keccak256(abi.encodePacked(
-            msg.sender,
-            identifier,
-            score,
-            nonce,
-            block.chainid
-        )); 
+        // === Signature verification  ===
+        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, identifier, score, nonce, block.chainid));
         bytes32 prefixedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
-        address recovered = ECDSA.recover(prefixedHash, v, r, s);
-        require(recovered == GAME_SIGNER, "Invalid signature");
+        require(ECDSA.recover(prefixedHash, v, r, s) == GAME_SIGNER, "Invalid sig");
 
         bytes32 idHash = keccak256(abi.encodePacked(identifier));
         require(!disqualified[idHash], "Disqualified");
 
         uint256 oldScore = scores[idHash];
-        if (score <= oldScore) return; // no improvement
+        if (score <= oldScore) return;
 
         scores[idHash] = score;
         scores2[msg.sender] = score;
+        identifierOf[idHash] = identifier;
 
-        // Store original string only when they enter top 30
-        if (oldScore == 0 && score > leaderboard[leaderboard.length - 1].score) {
-            identifierOf[idHash] = identifier;
-        }
+        uint256 pos = heapIndex[idHash];
 
-        if (_existsInLeaderboard(idHash)) {
-            _updateInHeap(idHash, score);
-        } else if (score > leaderboard[leaderboard.length - 1].score) {
-            _insertOrReplace(idHash, score);
-            if (oldScore == 0) identifierOf[idHash] = identifier;
+        if (pos != 0) {
+            // Already in top-N → increase score (bubble up in min-heap)
+            leaderboard[pos].score = score;
+            _bubbleUp(pos);
+        } else if (leaderboard.length < MAX_ENTRIES + 1) {
+            // Still room → insert new entry
+            _insertNew(idHash, score);
+        } else if (score > leaderboard[1].score) {
+            // Better than current worst → replace worst
+            _replaceWorst(idHash, score);
         }
 
         emit ScoreSubmitted(idHash, identifier, score, msg.sender);
     }
 
-    // ==================== MODERATOR: DISQUALIFY ====================
+    // ====================== INTERNAL HEAP  ===========================
+
+    function _insertNew(bytes32 idHash, uint256 score) private {
+        leaderboard.push(Entry(idHash, score));
+        uint256 idx = leaderboard.length - 1;
+        heapIndex[idHash] = idx;
+        _bubbleUp(idx);
+    }
+
+    function _replaceWorst(bytes32 idHash, uint256 score) private {
+        // Remove old worst
+        bytes32 oldHash = leaderboard[1].idHash;
+        heapIndex[oldHash] = 0;
+
+        // Overwrite root
+        leaderboard[1] = Entry(idHash, score);
+        heapIndex[idHash] = 1;
+
+        // Restore min-heap property
+        _bubbleDown(1);
+    }
+
+    function _bubbleUp(uint256 i) private {
+        Entry memory cand = leaderboard[i];
+        while (i > 1) {
+            uint256 parent = i / 2;
+            if (leaderboard[parent].score <= cand.score) break;
+
+            leaderboard[i] = leaderboard[parent];
+            heapIndex[leaderboard[i].idHash] = i;
+
+            i = parent;
+        }
+        leaderboard[i] = cand;
+        heapIndex[cand.idHash] = i;
+    }
+
+    function _bubbleDown(uint256 i) private {
+        Entry memory cand = leaderboard[i];
+        uint256 size = leaderboard.length;
+
+        while (true) {
+            uint256 left = i * 2;
+            uint256 right = left + 1;
+            uint256 smallest = i;
+
+            if (left < size && leaderboard[left].score < leaderboard[smallest].score)
+                smallest = left;
+            if (right < size && leaderboard[right].score < leaderboard[smallest].score)
+                smallest = right;
+
+            if (smallest == i) break;
+
+            leaderboard[i] = leaderboard[smallest];
+            heapIndex[leaderboard[i].idHash] = i;
+            i = smallest;
+        }
+        leaderboard[i] = cand;
+        heapIndex[cand.idHash] = i;
+    }
+
+    // ====================== DISQUALIFY ========================
     function disqualify(string calldata identifier) external onlyModerator {
         bytes32 idHash = keccak256(abi.encodePacked(identifier));
-        if (scores[idHash] == 0) return;
+        uint256 idx = heapIndex[idHash];
+        if (idx == 0) return;
 
-        disqualified[idHash] = true;
+        uint256 last = leaderboard.length - 1;
+        bytes32 lastHash = leaderboard[last].idHash;
+
+        if (idx != last) {
+            // Move last to removed position
+            leaderboard[idx] = leaderboard[last];
+            heapIndex[lastHash] = idx;
+
+            // Rebalance
+            _bubbleUp(idx);
+            _bubbleDown(idx);
+        }
+
+        leaderboard.pop();
+        heapIndex[idHash] = 0;
         delete scores[idHash];
         delete identifierOf[idHash];
-
-        if (_existsInLeaderboard(idHash)) {
-            _removeFromHeap(idHash);
-        }
 
         emit ScoreDisqualified(idHash, identifier);
     }
 
-    // ==================== ADMIN FUNCTIONS ====================
+    // ====================== ADMIN ======================
     function addModerator(address mod) external onlyAdmin {
         isModerator[mod] = true;
         emit ModeratorAdded(mod);
@@ -122,113 +182,51 @@ contract QshieldLeaderboard2 {
         emit ModeratorRemoved(mod);
     }
 
-    // ==================== VIEW: TOP 30 ====================
+    // ====================== VIEW  =========================
     function getTop() external view returns (string[] memory identifiers, uint256[] memory topScores) {
-        uint256 len = leaderboard.length > 1 ? leaderboard.length - 1 : 0;
+        uint256 len = leaderboard.length - 1;
+        if (len > MAX_ENTRIES) len = MAX_ENTRIES;
+
         identifiers = new string[](len);
         topScores = new uint256[](len);
 
+        // Temporary copy to sort in memory (descending)
+        Entry[] memory copy = new Entry[](len);
         for (uint256 i = 0; i < len; i++) {
-            bytes32 idHash = leaderboard[i + 1].idHash;
-            string memory id = identifierOf[idHash];
-            identifiers[i] = bytes(id).length > 0 ? id : _bytes32ToHex(idHash);
-            topScores[i] = leaderboard[i + 1].score;
+            copy[i] = leaderboard[i + 1];
         }
-    }
 
-    // ==================== VIEW: Your Score ================
-    function getScore() external view returns (uint256){
-        uint256 scr = scores2[msg.sender];
-        return scr;
-    }
-
-    // ==================== INTERNAL HEAP LOGIC ====================
-    function _existsInLeaderboard(bytes32 idHash) internal view returns (bool) {
-        for (uint256 i = 1; i < leaderboard.length; i++) {
-            if (leaderboard[i].idHash == idHash) return true;
-        }
-        return false;
-    }
-
-    function _updateInHeap(bytes32 idHash, uint256 newScore) internal {
-        for (uint256 i = 1; i < leaderboard.length; i++) {
-            if (leaderboard[i].idHash == idHash) {
-                leaderboard[i].score = newScore;
-                _bubbleUp(i);
-                _bubbleDown(i);
-                break;
-            }
-        }
-    }
-
-    function _insertOrReplace(bytes32 idHash, uint256 score) internal {
-        if (leaderboard.length <= MAX_ENTRIES) {
-            leaderboard.push(Entry(idHash, score));
-            _bubbleUp(leaderboard.length - 1);
-        } else {
-            leaderboard[leaderboard.length - 1] = Entry(idHash, score);
-            _bubbleUp(leaderboard.length - 1);
-        }
-    }
-
-    function _removeFromHeap(bytes32 idHash) internal {
-        uint256 len = leaderboard.length;
-        uint256 idx = type(uint256).max;
-
+        // Simple insertion sort (gas-efficient for small N <= 50)
         for (uint256 i = 1; i < len; i++) {
-            if (leaderboard[i].idHash == idHash) {
-                idx = i;
-                break;
+            Entry memory key = copy[i];
+            uint256 j = i;
+            while (j > 0 && copy[j-1].score < key.score) {
+                copy[j] = copy[j-1];
+                j--;
             }
+            copy[j] = key;
         }
-        if (idx == type(uint256).max) return;
 
-        leaderboard[idx] = leaderboard[len - 1];
-        leaderboard.pop();
-
-        if (idx < leaderboard.length) {
-            _bubbleUp(idx);
-            _bubbleDown(idx);
+        for (uint256 i = 0; i < len; i++) {
+            bytes32 h = copy[i].idHash;
+            identifiers[i] = bytes(identifierOf[h]).length > 0 ? identifierOf[h] : _bytes32ToHex(h);
+            topScores[i] = copy[i].score;
         }
     }
 
-    function _bubbleUp(uint256 i) internal {
-        Entry memory temp = leaderboard[i];
-        while (i > 1) {
-            uint256 parent = i / 2;
-            if (leaderboard[parent].score >= temp.score) break;
-            leaderboard[i] = leaderboard[parent];
-            i = parent;
-        }
-        leaderboard[i] = temp;
+    function getScore() external view returns (uint256) {
+        return scores2[msg.sender];
     }
 
-    function _bubbleDown(uint256 i) internal {
-        Entry memory temp = leaderboard[i];
-        uint256 len = leaderboard.length;
-
-        while (true) {
-            uint256 left = i * 2;
-            uint256 right = left + 1;
-            uint256 largest = i;
-
-            if (left < len && leaderboard[left].score > leaderboard[largest].score)
-                largest = left;
-            if (right < len && leaderboard[right].score > leaderboard[largest].score)
-                largest = right;
-
-            if (largest == i) break;
-            leaderboard[i] = leaderboard[largest];
-            i = largest;
-        }
-        leaderboard[i] = temp;
+    function getSize() external pure returns (uint256){
+        return MAX_ENTRIES;
     }
 
     function _bytes32ToHex(bytes32 b) internal pure returns (string memory) {
         bytes memory alphabet = "0123456789abcdef";
         bytes memory str = new bytes(64);
         for (uint256 i = 0; i < 32; i++) {
-            str[i*2]   = alphabet[uint8(b[i] >> 4)];
+            str[i*2] = alphabet[uint8(b[i] >> 4)];
             str[i*2+1] = alphabet[uint8(b[i] & 0x0f)];
         }
         return string(str);
