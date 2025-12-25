@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
@@ -13,8 +13,8 @@ contract QshieldLeaderboard {
     mapping(address => bool) public isModerator;
 
     // ==================== DATA  ====================
-    mapping(bytes32 => uint256) public scores;           // idHash => best score
-    mapping(address => uint256) public scores2;          // player address => score (kept for backward compat)
+    mapping(bytes32 => uint256) public scores;           // idHash => score for this specific submission
+    mapping(address => uint256) public scores2;          // player address => personal best score (across all their submissions)
     mapping(bytes32 => string) public identifierOf;
     mapping(bytes32 => bool) public disqualified;
     mapping(bytes32 => uint256) private heapIndex;       // idHash => position in leaderboard (0 = not present)
@@ -51,7 +51,7 @@ contract QshieldLeaderboard {
     ) external {
         require(score > 0, "Score > 0");
 
-        // === Signature verification  ===
+        // === Signature verification ===
         bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, identifier, score, nonce, block.chainid));
         bytes32 prefixedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
         require(ECDSA.recover(prefixedHash, v, r, s) == GAME_SIGNER, "Invalid sig");
@@ -59,19 +59,23 @@ contract QshieldLeaderboard {
         bytes32 idHash = keccak256(abi.encodePacked(identifier));
         require(!disqualified[idHash], "Disqualified");
 
-        uint256 oldScore = scores[idHash];
-        if (score <= oldScore) return;
-
+        // Store this specific submission
         scores[idHash] = score;
-        scores2[msg.sender] = score;
         identifierOf[idHash] = identifier;
 
+        // Update player's personal best if this submission beats it
+        if (score > scores2[msg.sender]) {
+            scores2[msg.sender] = score;
+        }
+
+        // Leaderboard handling
         uint256 pos = heapIndex[idHash];
 
         if (pos != 0) {
-            // Already in top-N → increase score (bubble up in min-heap)
+            // Already in leaderboard → update score and rebalance
             leaderboard[pos].score = score;
             _bubbleUp(pos);
+            _bubbleDown(1);
         } else if (leaderboard.length < MAX_ENTRIES + 1) {
             // Still room → insert new entry
             _insertNew(idHash, score);
